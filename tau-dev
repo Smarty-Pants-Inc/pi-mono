@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 #
-# tau-dev: Self-updating tau launcher for development fork
+# tau-dev: Local Tau launcher for development fork
 #
-# Automatically merges upstream changes, rebuilds, and launches tau.
-# If merge conflicts occur, warns but still launches so you can use tau to resolve them.
+# - Ensures dependencies are installed and builds only what is stale.
+# - Launches tau from your current working directory.
+#
+# Optional:
+#   TAU_DEV_SYNC_UPSTREAM=1  Fetch+merge upstream/main (badlogic/pi-mono) before building.
 #
 
-set -e
+set -euo pipefail
 
-# Save original working directory (for tau to use)
 ORIGINAL_CWD="$(pwd)"
-
-# Change to script directory for git operations
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
 # Colors
 RED='\033[0;31m'
@@ -27,92 +26,136 @@ warn() { echo -e "${YELLOW}[tau-dev]${RESET} $1"; }
 error() { echo -e "${RED}[tau-dev]${RESET} $1"; }
 success() { echo -e "${GREEN}[tau-dev]${RESET} $1"; }
 
-# Check if we have uncommitted changes
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    warn "Uncommitted changes detected, skipping upstream sync"
-    SKIP_SYNC=1
+cd "$SCRIPT_DIR"
+
+SYNC_UPSTREAM="${TAU_DEV_SYNC_UPSTREAM:-0}"
+
+has_uncommitted_changes() {
+	! git diff --quiet || ! git diff --cached --quiet
+}
+
+maybe_sync_upstream() {
+	if [[ "$SYNC_UPSTREAM" != "1" ]]; then
+		return
+	fi
+	if has_uncommitted_changes; then
+		warn "Uncommitted changes detected, skipping upstream sync"
+		return
+	fi
+
+	if ! git remote get-url upstream >/dev/null 2>&1; then
+		git remote add upstream https://github.com/badlogic/pi-mono.git
+	fi
+
+	log "Fetching upstream..."
+	if ! git fetch upstream --quiet 2>/dev/null; then
+		warn "Could not fetch upstream, continuing with current version"
+		return
+	fi
+
+	LOCAL="$(git rev-parse HEAD)"
+	UPSTREAM="$(git rev-parse upstream/main 2>/dev/null || echo "")"
+	BASE="$(git merge-base HEAD upstream/main 2>/dev/null || echo "")"
+
+	if [[ -z "$UPSTREAM" ]] || [[ "$LOCAL" = "$UPSTREAM" ]]; then
+		log "Already up to date with upstream"
+		return
+	fi
+
+	log "Merging upstream/main..."
+	if git merge upstream/main --no-edit 2>/dev/null; then
+		success "Merged upstream changes successfully"
+	else
+		error "Merge conflict detected!"
+		echo ""
+		warn "Conflict files:"
+		git diff --name-only --diff-filter=U | sed 's/^/  /'
+		echo ""
+		warn "Resolve conflicts, then run: git add . && git commit"
+		echo ""
+		exit 1
+	fi
+}
+
+ensure_deps() {
+	if [[ ! -d "node_modules" ]]; then
+		log "Installing dependencies (npm ci --ignore-scripts)..."
+		npm ci --ignore-scripts --silent
+		return
+	fi
+	if [[ -f "package-lock.json" && -f "node_modules/.package-lock.json" && "package-lock.json" -nt "node_modules/.package-lock.json" ]]; then
+		log "package-lock.json changed; reinstalling deps (npm ci --ignore-scripts)..."
+		npm ci --ignore-scripts --silent
+	fi
+}
+
+needs_build_pkg() {
+	local pkg_dir="$1"
+	local marker="$2"
+
+	if [[ ! -f "$marker" ]]; then
+		return 0
+	fi
+
+	local f
+	for f in "$pkg_dir/package.json" "$pkg_dir/tsconfig.build.json" "$pkg_dir/tsconfig.json"; do
+		if [[ -f "$f" && "$f" -nt "$marker" ]]; then
+			return 0
+		fi
+	done
+
+	local newer
+	if [[ -d "$pkg_dir/src" ]]; then
+		newer="$(find "$pkg_dir/src" -type f -newer "$marker" -print -quit 2>/dev/null || true)"
+		if [[ -n "$newer" ]]; then
+			return 0
+		fi
+	fi
+	if [[ -d "$pkg_dir/scripts" ]]; then
+		newer="$(find "$pkg_dir/scripts" -type f -newer "$marker" -print -quit 2>/dev/null || true)"
+		if [[ -n "$newer" ]]; then
+			return 0
+		fi
+	fi
+
+	return 1
+}
+
+build_ws() {
+	local ws="$1"
+	log "Building $ws..."
+	npm run build -w "$ws" --silent
+}
+
+
+maybe_sync_upstream
+ensure_deps
+
+# Build only what is stale. Avoid rebuilding pi-ai (networked model generation)
+# unless its sources changed or dist is missing.
+
+NEEDS_TUI=0
+NEEDS_AI=0
+NEEDS_AGENT=0
+NEEDS_CODING_AGENT=0
+
+if needs_build_pkg "packages/tui" "packages/tui/dist/index.js"; then NEEDS_TUI=1; fi
+if needs_build_pkg "packages/ai" "packages/ai/dist/index.js"; then NEEDS_AI=1; fi
+if needs_build_pkg "packages/agent" "packages/agent/dist/index.js"; then NEEDS_AGENT=1; fi
+if needs_build_pkg "packages/coding-agent" "packages/coding-agent/dist/cli.js"; then NEEDS_CODING_AGENT=1; fi
+
+if [[ "$NEEDS_TUI" -eq 1 ]]; then build_ws "@mariozechner/pi-tui"; fi
+if [[ "$NEEDS_AI" -eq 1 ]]; then build_ws "@mariozechner/pi-ai"; fi
+if [[ "$NEEDS_AGENT" -eq 1 ]]; then build_ws "@mariozechner/pi-agent-core"; fi
+
+# Rebuild coding-agent if it (or its deps) changed.
+if [[ "$NEEDS_CODING_AGENT" -eq 1 || "$NEEDS_TUI" -eq 1 || "$NEEDS_AI" -eq 1 || "$NEEDS_AGENT" -eq 1 ]]; then
+	build_ws "@mariozechner/pi-coding-agent"
 fi
 
-if [ -z "$SKIP_SYNC" ]; then
-    if ! git remote get-url upstream >/dev/null 2>&1; then
-        git remote add upstream https://github.com/badlogic/pi-mono.git
-    fi
-    log "Fetching upstream..."
-    git fetch upstream --quiet 2>/dev/null || {
-        warn "Could not fetch upstream, continuing with current version"
-        SKIP_SYNC=1
-    }
-fi
-
-if [ -z "$SKIP_SYNC" ]; then
-    # Check if we're behind upstream
-    LOCAL=$(git rev-parse HEAD)
-    UPSTREAM=$(git rev-parse upstream/main 2>/dev/null || echo "")
-    BASE=$(git merge-base HEAD upstream/main 2>/dev/null || echo "")
-
-    if [ -n "$UPSTREAM" ] && [ "$LOCAL" != "$UPSTREAM" ]; then
-        if [ "$BASE" = "$LOCAL" ]; then
-            log "Behind upstream, attempting merge..."
-            if git merge upstream/main --no-edit 2>/dev/null; then
-                success "Merged upstream changes successfully"
-                NEEDS_BUILD=1
-            else
-                error "Merge conflict detected!"
-                echo ""
-                warn "Conflict files:"
-                git diff --name-only --diff-filter=U | sed 's/^/  /'
-                echo ""
-                warn "Launching tau so you can resolve conflicts..."
-                warn "After resolving, run: git add . && git commit"
-                echo ""
-                MERGE_CONFLICT=1
-            fi
-        elif [ "$BASE" = "$UPSTREAM" ]; then
-            log "Ahead of upstream, no merge needed"
-        else
-            log "Diverged from upstream, attempting merge..."
-            if git merge upstream/main --no-edit 2>/dev/null; then
-                success "Merged upstream changes successfully"
-                NEEDS_BUILD=1
-            else
-                error "Merge conflict detected!"
-                echo ""
-                warn "Conflict files:"
-                git diff --name-only --diff-filter=U | sed 's/^/  /'
-                echo ""
-                warn "Launching tau so you can resolve conflicts..."
-                warn "After resolving, run: git add . && git commit"
-                echo ""
-                MERGE_CONFLICT=1
-            fi
-        fi
-    else
-        log "Already up to date with upstream"
-    fi
-fi
-
-# Build if needed (merged new changes or dist doesn't exist)
-if [ -n "$NEEDS_BUILD" ] || [ ! -f "packages/coding-agent/dist/cli.js" ]; then
-    if [ -z "$MERGE_CONFLICT" ]; then
-        log "Building..."
-        if npm run build --silent 2>/dev/null; then
-            success "Build complete"
-        else
-            error "Build failed!"
-            if [ -f "packages/coding-agent/dist/cli.js" ]; then
-                warn "Using previous build..."
-            else
-                error "No previous build available, cannot launch"
-                exit 1
-            fi
-        fi
-    else
-        warn "Skipping build due to merge conflict"
-        if [ ! -f "packages/coding-agent/dist/cli.js" ]; then
-            error "No previous build available, cannot launch"
-            exit 1
-        fi
-    fi
+if [[ ! -f "packages/coding-agent/dist/cli.js" ]]; then
+	error "No build available (packages/coding-agent/dist/cli.js missing)"
+	exit 1
 fi
 
 # Launch tau from original working directory
