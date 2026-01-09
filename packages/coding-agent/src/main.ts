@@ -13,7 +13,7 @@ import { type Args, parseArgs, printHelp } from "./cli/args.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
-import { CONFIG_DIR_NAME, getAgentDir, getModelsPath, VERSION } from "./config.js";
+import { CONFIG_DIR_NAME, ENV_AGENT_DIR, getAgentDir, getModelsPath, VERSION } from "./config.js";
 import { createEventBus } from "./core/event-bus.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import { discoverAndLoadExtensions, type LoadExtensionsResult, loadExtensions } from "./core/extensions/index.js";
@@ -220,6 +220,7 @@ export async function main(args: string[]) {
 	// Early load extensions to discover their CLI flags (unless --no-extensions)
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
+	process.env[ENV_AGENT_DIR] ??= agentDir;
 	const eventBus = createEventBus();
 	const settingsManager = SettingsManager.create(cwd);
 	time("SettingsManager.create");

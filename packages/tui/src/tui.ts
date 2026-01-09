@@ -41,6 +41,17 @@ export interface Component {
 
 export { visibleWidth };
 
+function inferAgentDirFromEnv(): { agentDir: string; appName: string } {
+	const suffix = "_CODING_AGENT_DIR";
+	for (const [key, value] of Object.entries(process.env)) {
+		if (!value) continue;
+		if (!key.endsWith(suffix)) continue;
+		const appName = key.slice(0, -suffix.length).toLowerCase();
+		return { agentDir: value, appName: appName || "pi" };
+	}
+	return { agentDir: path.join(os.homedir(), ".pi", "agent"), appName: "pi" };
+}
+
 /**
  * Container - a component that contains other components
  */
@@ -429,7 +440,8 @@ export class TUI extends Container {
 			const isImageLine = this.containsImage(line);
 			if (!isImageLine && visibleWidth(line) > width) {
 				// Log all lines to crash file for debugging
-				const crashLogPath = path.join(os.homedir(), ".pi", "agent", "pi-crash.log");
+				const { agentDir, appName } = inferAgentDirFromEnv();
+				const crashLogPath = path.join(agentDir, `${appName}-crash.log`);
 				const crashData = [
 					`Crash at ${new Date().toISOString()}`,
 					`Terminal width: ${width}`,
